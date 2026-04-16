@@ -9,7 +9,6 @@ Functions:
     main            — parse CLI args and launch the application
 """
 
-import bisect
 import sys
 import os
 import re
@@ -647,9 +646,11 @@ class KeypointEditor(QMainWindow):
         for entry in self._pose_data.get("athlete_frames", []):
             vf = entry["frame"]
             self._frame_map[vf] = entry
-            self._frame_list.append(vf)
             self._orig_kps[vf] = deepcopy(entry["keypoints"])
-        self._frame_list.sort()
+        if self._total_frames > 0:
+            self._frame_list = list(range(self._total_frames))
+        else:
+            self._frame_list = sorted(self._frame_map.keys())
         n = len(self._frame_list)
         self._slider.blockSignals(True)
         self._slider.setMaximum(max(0, n - 1))
@@ -661,7 +662,7 @@ class KeypointEditor(QMainWindow):
         self._show(0)
         self.view.fit()
         self._status.showMessage(
-            f"{self._current_pid}  |  model: {model_name}  |  {n} tracked frames")
+            f"{self._current_pid}  |  model: {model_name}  |  {n} frames  |  {len(self._frame_map)} poses")
 
     def _refresh_keypoints(self):
         if not self._poses_parent:
@@ -797,9 +798,13 @@ class KeypointEditor(QMainWindow):
         for entry in self._pose_data.get("athlete_frames", []):
             vf = entry["frame"]
             self._frame_map[vf] = entry
-            self._frame_list.append(vf)
             self._orig_kps[vf] = deepcopy(entry["keypoints"])
-        self._frame_list.sort()
+
+        # Show all video frames; overlay only where poses exist
+        if self._total_frames > 0:
+            self._frame_list = list(range(self._total_frames))
+        else:
+            self._frame_list = sorted(self._frame_map.keys())
 
         n = len(self._frame_list)
         self._slider.blockSignals(True)
@@ -839,8 +844,7 @@ class KeypointEditor(QMainWindow):
                 (self._anom_df["is_low_prob"].astype(str).str.lower() == "true")
             ]
             self._anomaly_frames = set(rows["frame"].astype(int))
-            flagged_idxs = [i for i, vf in enumerate(self._frame_list)
-                            if vf in self._anomaly_frames]
+            flagged_idxs = [vf for vf in self._anomaly_frames if vf < n]
             self._mark_bar.set_marks(max(0, n - 1), flagged_idxs)
 
         # Drill event markers
@@ -874,8 +878,9 @@ class KeypointEditor(QMainWindow):
             self.view.fit()
 
         has_3d = bool(self._frames_3d)
+        n_poses = len(self._frame_map)
         self._status.showMessage(
-            f"{pid}  |  {n} tracked frames  |  {self._fps:.1f} fps"
+            f"{pid}  |  {n} frames  |  {n_poses} poses  |  {self._fps:.1f} fps"
             + (f"  |  3D: {len(self._frames_3d)} frames" if has_3d else "  |  3D: none")
             + (f"  |  {len(self._anomaly_frames)} anomalous" if self._anomaly_frames else "")
         )
@@ -883,20 +888,14 @@ class KeypointEditor(QMainWindow):
     def _update_event_marks(self, maximum: int):
         """
         Convert event video-frame numbers to timeline list-indices and push to mark bar.
-        Uses bisect to find the nearest list index when the exact frame isn't tracked.
+        Since _frame_list now covers all video frames, list_idx == vframe directly.
         """
-        vf_to_idx = {vf: i for i, vf in enumerate(self._frame_list)}
         event_ticks: dict[str, list[int]] = {}
         for ev_key in _EVENT_LABELS:
             vf = self._current_events.get(f"{ev_key}_frame")
             if vf is None:
                 continue
-            idx = vf_to_idx.get(vf)
-            if idx is None:
-                # Nearest tracked frame (e.g. ball_lift may be pre-drill)
-                pos = bisect.bisect_left(self._frame_list, vf)
-                pos = max(0, min(pos, len(self._frame_list) - 1))
-                idx = pos
+            idx = max(0, min(vf, maximum))
             event_ticks[ev_key] = [idx]
         self._mark_bar.set_events(event_ticks)
 
@@ -929,6 +928,8 @@ class KeypointEditor(QMainWindow):
             else:
                 self.scene.load_keypoints(kps, self._edit_mode)
             self.scene.set_kps_visible(self._kps_visible)
+        else:
+            self.scene.clear_keypoints()
 
         # Update 3D skeleton panel (NEW)
         self._skeleton_3d.update_frame(vf)
@@ -938,9 +939,9 @@ class KeypointEditor(QMainWindow):
         self._slider.blockSignals(False)
 
         ts = entry.get("timestamp", vf / self._fps) if entry else vf / self._fps
+        pose_tag = f"  [{len(self._frame_map)} poses]" if entry is None else ""
         self._lbl_frame.setText(
-            f"Frame {vf}/{max(0, self._total_frames-1)}  "
-            f"[{list_idx+1}/{len(self._frame_list)}]")
+            f"Frame {vf}/{max(0, self._total_frames-1)}{pose_tag}")
         self._lbl_time.setText(f"{ts:.3f} s")
         state = self._player_states.get(self._current_pid)
         has_edits = bool(state and vf in state.edits)

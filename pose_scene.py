@@ -459,6 +459,10 @@ class PoseScene(QGraphicsScene):
         self._lines.clear()
         self._kp_labels.clear()
 
+    def clear_keypoints(self):
+        """Remove all keypoint/skeleton items (call when current frame has no pose)."""
+        self._clear_pose()
+
     def set_kps_visible(self, v: bool):
         for item in self._kps + self._lines:
             item.setVisible(v)
