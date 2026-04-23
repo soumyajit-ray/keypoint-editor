@@ -25,7 +25,8 @@ class SetupDialog(QDialog):
 
     def __init__(self, parent=None,
                  init_videos="", init_poses="", init_poses_3d="",
-                 init_features="", init_anomalies="", init_events=""):
+                 init_features="", init_anomalies="", init_events="",
+                 init_annotations=""):
         super().__init__(parent)
         self.setWindowTitle("Keypoint Editor — Session Setup")
         self.setMinimumWidth(560)
@@ -39,6 +40,7 @@ class SetupDialog(QDialog):
         self.features_csv    = ""
         self.anomaly_csv     = ""
         self.events_folder   = ""
+        self.annotations_csv = ""
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
@@ -149,6 +151,24 @@ class SetupDialog(QDialog):
         if self._events_edit.text():
             self._on_events_folder_changed(self._events_edit.text())
 
+        # Annotations CSV
+        self._ann_edit, ann_grp = self._file_row(
+            "Annotations CSV  (optional)",
+            "CSV to read/write manual towel frame annotations.  "
+            "Accepts docs/towel_frames.csv column style (t1_contact_frame …) "
+            "and native style (towel1_contact_frame …).  Leave empty to skip.",
+            init_annotations or self._settings.value("last_annotations_csv", ""),
+        )
+        layout.addWidget(ann_grp)
+
+        self._ann_status = QLabel("")
+        self._ann_status.setStyleSheet("color:#a8c0d8; font-size:12px; font-style:italic;")
+        layout.addWidget(self._ann_status)
+
+        self._ann_edit.textChanged.connect(self._on_ann_csv_changed)
+        if self._ann_edit.text():
+            self._on_ann_csv_changed(self._ann_edit.text())
+
         # Buttons
         layout.addSpacing(6)
         btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
@@ -217,6 +237,41 @@ class SetupDialog(QDialog):
         d = QFileDialog.getExistingDirectory(self, "Select Folder", start)
         if d:
             edit.setText(d)
+
+    def _browse_file(self, edit: QLineEdit):
+        start = str(Path(edit.text()).parent) if edit.text() else os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select CSV File", start, "CSV files (*.csv)")
+        if path:
+            edit.setText(path)
+
+    def _file_row(self, title: str, hint: str, default: str = ""):
+        """Like _folder_row but the Browse button opens a file picker."""
+        grp = QGroupBox(title)
+        grp.setStyleSheet(
+            "QGroupBox { color:#d4d4d4; font-size:12px; border:1px solid #444; "
+            "border-radius:4px; margin-top:8px; padding-top:8px; }"
+            "QGroupBox::title { subcontrol-origin:margin; left:8px; }"
+        )
+        v = QVBoxLayout(grp)
+        v.setContentsMargins(8, 6, 8, 6)
+        v.setSpacing(4)
+        h = QHBoxLayout()
+        edit = QLineEdit(default)
+        edit.setPlaceholderText("Click Browse… to select a CSV file")
+        edit.setToolTip(hint)
+        browse = QPushButton("Browse…")
+        browse.setFixedWidth(80)
+        browse.setToolTip(f"Open file browser — {hint}")
+        browse.clicked.connect(lambda: self._browse_file(edit))
+        h.addWidget(edit)
+        h.addWidget(browse)
+        v.addLayout(h)
+        hint_lbl = QLabel(hint)
+        hint_lbl.setStyleSheet("color:#a8c0d8; font-size:12px;")
+        hint_lbl.setWordWrap(True)
+        v.addWidget(hint_lbl)
+        return edit, grp
 
     # ── CSV detection ─────────────────────────────────────────────────────────
 
@@ -297,6 +352,38 @@ class SetupDialog(QDialog):
                 self._events_status.setStyleSheet(
                     "color:#69f0ae; font-size:12px; font-style:italic;")
 
+    def _on_ann_csv_changed(self, text: str):
+        p = Path(text.strip())
+        if not text.strip():
+            self._ann_status.setText("")
+            return
+        if not p.is_file():
+            self._ann_status.setText("File not found")
+            self._ann_status.setStyleSheet("color:#f88; font-size:12px; font-style:italic;")
+            return
+        try:
+            with open(p, newline="") as f:
+                reader = _csv.reader(f)
+                header = next(reader, [])
+                n = sum(1 for _ in reader)
+            known_cols = {
+                "t1_contact_frame", "t1_release_frame",
+                "t2_contact_frame", "t2_release_frame",
+                "towel1_contact_frame", "towel1_release_frame",
+                "towel2_contact_frame", "towel2_release_frame",
+            }
+            if "player_id" not in header or not known_cols.intersection(header):
+                self._ann_status.setText(
+                    "No recognised annotation columns found (expected player_id + t1_*/towel1_* …)")
+                self._ann_status.setStyleSheet("color:#f88; font-size:12px; font-style:italic;")
+            else:
+                self._ann_status.setText(f"Found {n} player row(s)")
+                self._ann_status.setStyleSheet(
+                    "color:#69f0ae; font-size:12px; font-style:italic;")
+        except Exception as e:
+            self._ann_status.setText(f"Could not read file: {e}")
+            self._ann_status.setStyleSheet("color:#f88; font-size:12px; font-style:italic;")
+
     def _validate(self):
         ok = (Path(self._vid_edit.text()).is_dir() and
               Path(self._pose_edit.text()).is_dir())
@@ -329,4 +416,6 @@ class SetupDialog(QDialog):
                                 Path(self.anomaly_csv).parent.as_posix()
                                 if self.anomaly_csv else "")
         self._settings.setValue("last_events_dir", self.events_folder)
+        self.annotations_csv = self._ann_edit.text().strip()
+        self._settings.setValue("last_annotations_csv", self.annotations_csv)
         self.accept()

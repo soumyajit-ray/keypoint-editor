@@ -51,6 +51,7 @@ from player_panel import PlayerListPanel
 from feature_panel import FeaturePanel, FeatureDescPanel
 from setup_dialog import SetupDialog
 from skeleton_3d import Skeleton3DPanel
+from annotation_panel import AnnotationPanel, ANNOTATION_EVENTS
 
 import cv2
 
@@ -129,6 +130,10 @@ class KeypointEditor(QMainWindow):
         self._last_read_vf: int = -2
         self._anomaly_frames: set[int] = set()
         self._current_events: dict = {}          # loaded from <events_dir>/<pid>_events.json
+        self._current_event_ticks: dict[str, list[int]] = {}  # vframe indices for mark bar
+
+        self._annotations:      dict[str, dict[str, int]] = {}  # pid → {ev_key → vframe}
+        self._annotations_csv:  str = ""
 
         self._frames_3d:    dict[int, np.ndarray] = {}   # NEW
 
@@ -219,6 +224,25 @@ class KeypointEditor(QMainWindow):
         # Keep toolbar checkbox in sync when dock is closed via X
         self._dock_3d.visibilityChanged.connect(
             lambda v: self._act_3d.setChecked(v))
+
+        # ── Annotation dock ───────────────────────────────────────────────────
+        self._annotation_panel = AnnotationPanel()
+        self._annotation_panel.mark_requested.connect(self._on_mark_requested)
+        self._annotation_panel.clear_requested.connect(self._on_clear_requested)
+        self._annotation_panel.save_requested.connect(self._save_annotations)
+
+        self._dock_ann = QDockWidget("Towel Annotations", self)
+        self._dock_ann.setWidget(self._annotation_panel)
+        self._dock_ann.setMinimumWidth(260)
+        self._dock_ann.setMaximumWidth(320)
+        self._dock_ann.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable)
+        self._dock_ann.hide()
+        self.addDockWidget(Qt.RightDockWidgetArea, self._dock_ann)
+        self._dock_ann.visibilityChanged.connect(
+            lambda v: self._act_annotate.setChecked(v))
 
         self._status = QStatusBar()
         self._status.showMessage("Open the setup dialog to load a session  (File → New Session…)")
@@ -344,6 +368,16 @@ class KeypointEditor(QMainWindow):
         self._act_3d.triggered.connect(self._on_3d_toggled)
         tb.addAction(self._act_3d)
 
+        self._act_annotate = QAction("Annotate  (A)", self)
+        self._act_annotate.setCheckable(True)
+        self._act_annotate.setChecked(False)
+        self._act_annotate.setShortcut(QKeySequence("A"))
+        self._act_annotate.setToolTip(
+            "Show / hide the towel annotation panel  (A)\n"
+            "Keys 1–4 stamp T1 pickup / drop / T2 pickup / drop at the current frame.")
+        self._act_annotate.triggered.connect(self._on_annotate_toggled)
+        tb.addAction(self._act_annotate)
+
         act_setup = QAction("New Session…", self)
         act_setup.setToolTip("Open the setup dialog to change folders or start a new session")
         act_setup.triggered.connect(self._run_setup_dialog)
@@ -452,6 +486,12 @@ class KeypointEditor(QMainWindow):
         QShortcut(QKeySequence("F"),          self, self.view.fit)
         QShortcut(QKeySequence("F11"),        self, self._toggle_fullscreen)
 
+        # Annotation shortcuts — only fire when the annotation dock is visible
+        for i, (ev_key, _label, _color) in enumerate(ANNOTATION_EVENTS, 1):
+            QShortcut(QKeySequence(str(i)), self,
+                      lambda k=ev_key: self._dock_ann.isVisible() and self._on_mark_requested(k))
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, self._save_annotations)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Session initialisation
     # ─────────────────────────────────────────────────────────────────────────
@@ -461,22 +501,27 @@ class KeypointEditor(QMainWindow):
             self,
             self._video_folder, self._poses_parent, self._poses_3d_dir,
             self._features_csv, self._anomaly_csv, self._events_dir,
+            self._annotations_csv,
         )
         if dlg.exec_() != QDialog.Accepted:
             if not self._video_folder:
                 QApplication.quit()
             return
-        self._video_folder  = dlg.video_folder
-        self._poses_parent  = dlg.poses_folder
-        self._poses_3d_dir  = dlg.poses_3d_folder
-        self._features_csv  = dlg.features_csv
-        self._anomaly_csv   = dlg.anomaly_csv
-        self._events_dir    = dlg.events_folder
+        self._video_folder    = dlg.video_folder
+        self._poses_parent    = dlg.poses_folder
+        self._poses_3d_dir    = dlg.poses_3d_folder
+        self._features_csv    = dlg.features_csv
+        self._anomaly_csv     = dlg.anomaly_csv
+        self._events_dir      = dlg.events_folder
+        self._annotations_csv = dlg.annotations_csv
+        self._annotations.clear()
         self._current_model = ""
         self._init_session()
 
     def _init_session(self):
         self._load_csvs()
+        if self._annotations_csv:
+            self._load_annotations_csv(self._annotations_csv)
         self._scan_players()
         self._player_panel.populate(list(self._players.values()))
 
@@ -715,6 +760,10 @@ class KeypointEditor(QMainWindow):
         """Show/hide the 3D skeleton dock panel."""
         self._dock_3d.setVisible(checked)
 
+    def _on_annotate_toggled(self, checked: bool):
+        """Show/hide the towel annotation dock panel."""
+        self._dock_ann.setVisible(checked)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Player loading (3D data integrated)
     # ─────────────────────────────────────────────────────────────────────────
@@ -859,6 +908,9 @@ class KeypointEditor(QMainWindow):
                     pass
         self._update_event_marks(n)
 
+        # Annotation panel
+        self._annotation_panel.update_display(self._annotations.get(pid))
+
         # Feature panel
         feature_row = None
         if self._feat_df is not None:
@@ -887,17 +939,29 @@ class KeypointEditor(QMainWindow):
 
     def _update_event_marks(self, maximum: int):
         """
-        Convert event video-frame numbers to timeline list-indices and push to mark bar.
+        Convert event video-frame numbers to timeline list-indices, store in
+        self._current_event_ticks, then call _update_annotation_ticks() which
+        merges with manual annotations and pushes to the mark bar.
         Since _frame_list now covers all video frames, list_idx == vframe directly.
         """
-        event_ticks: dict[str, list[int]] = {}
+        self._current_event_ticks = {}
         for ev_key in _EVENT_LABELS:
             vf = self._current_events.get(f"{ev_key}_frame")
             if vf is None:
                 continue
             idx = max(0, min(vf, maximum))
-            event_ticks[ev_key] = [idx]
-        self._mark_bar.set_events(event_ticks)
+            self._current_event_ticks[ev_key] = [idx]
+        self._update_annotation_ticks()
+
+    def _update_annotation_ticks(self):
+        """Merge auto-detected event ticks with manual annotations and update the mark bar."""
+        ann = self._annotations.get(self._current_pid, {})
+        n = len(self._frame_list)
+        events = dict(self._current_event_ticks)
+        for ev_key, vf in ann.items():
+            idx = max(0, min(vf, max(0, n - 1)))
+            events[ev_key] = [idx]   # manual annotation overrides auto for same key
+        self._mark_bar.set_events(events)
 
     def _on_event_tick_clicked(self, list_idx: int):
         """Called when the user clicks an event tick in the mark bar."""
@@ -933,6 +997,9 @@ class KeypointEditor(QMainWindow):
 
         # Update 3D skeleton panel (NEW)
         self._skeleton_3d.update_frame(vf)
+
+        # Update annotation panel current-frame hint
+        self._annotation_panel.set_current_frame(vf)
 
         self._slider.blockSignals(True)
         self._slider.setValue(list_idx)
@@ -1146,6 +1213,106 @@ class KeypointEditor(QMainWindow):
         self._status.showMessage(
             f"Saved {n} edited frame(s) → {Path(poses_path).name}  "
             f"(backup: {Path(bak).name})")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Annotation: mark / clear / load / save
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_mark_requested(self, event_key: str):
+        if not self._frame_list or self._current_pid is None:
+            return
+        vf = self._frame_list[self._list_idx]
+        self._annotations.setdefault(self._current_pid, {})[event_key] = vf
+        self._annotation_panel.update_display(self._annotations[self._current_pid])
+        self._update_annotation_ticks()
+        self._save_annotations(silent=True)
+        self._status.showMessage(
+            f"Annotated {event_key} → frame {vf}  ({self._current_pid})")
+
+    def _on_clear_requested(self, event_key: str):
+        if self._current_pid is None:
+            return
+        self._annotations.get(self._current_pid, {}).pop(event_key, None)
+        self._annotation_panel.update_display(self._annotations.get(self._current_pid))
+        self._update_annotation_ticks()
+        self._save_annotations(silent=True)
+
+    def _load_annotations_csv(self, path: str):
+        """Load annotations from a CSV, supporting both column naming conventions."""
+        p = Path(path)
+        if not p.is_file():
+            return
+        COL_MAP = {
+            "t1_contact_frame":      "towel1_contact",
+            "t1_release_frame":      "towel1_release",
+            "t2_contact_frame":      "towel2_contact",
+            "t2_release_frame":      "towel2_release",
+            "towel1_contact_frame":  "towel1_contact",
+            "towel1_release_frame":  "towel1_release",
+            "towel2_contact_frame":  "towel2_contact",
+            "towel2_release_frame":  "towel2_release",
+        }
+        _BAD = {"not detected", "not found", ""}
+        loaded = 0
+        try:
+            with open(p, newline="") as fh:
+                for row in _csv.DictReader(fh):
+                    pid = row.get("player_id", "").strip()
+                    if not pid:
+                        continue
+                    entry: dict[str, int] = {}
+                    for col, ev_key in COL_MAP.items():
+                        val = row.get(col, "").strip()
+                        if val and val.lower() not in _BAD:
+                            try:
+                                entry[ev_key] = int(float(val))
+                            except ValueError:
+                                pass
+                    if entry:
+                        self._annotations[pid] = entry
+                        loaded += 1
+        except Exception as e:
+            self._status.showMessage(f"Could not load annotations CSV: {e}")
+            return
+        self._status.showMessage(
+            f"Annotations loaded: {Path(path).name}  ({loaded} players)")
+
+    def _save_annotations(self, silent: bool = False):
+        """Write all annotations to the configured CSV, preserving existing rows."""
+        if not self._annotations_csv:
+            return
+        path = Path(self._annotations_csv)
+        cols = ["player_id"] + [k + "_frame" for k, _lbl, _col in ANNOTATION_EVENTS]
+        # Preserve any rows on disk that are not yet in memory
+        existing: dict[str, dict] = {}
+        if path.is_file():
+            try:
+                with open(path, newline="") as fh:
+                    for row in _csv.DictReader(fh):
+                        pid = row.get("player_id", "")
+                        if pid:
+                            existing[pid] = dict(row)
+            except Exception:
+                pass
+        for pid, ann in self._annotations.items():
+            row = {"player_id": pid}
+            for ev_key, _lbl, _col in ANNOTATION_EVENTS:
+                row[ev_key + "_frame"] = ann.get(ev_key, "")
+            existing[pid] = row
+        try:
+            with open(path, "w", newline="") as fh:
+                w = _csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                for row in sorted(existing.values(), key=lambda r: r["player_id"]):
+                    w.writerow(row)
+        except Exception as e:
+            self._status.showMessage(f"Could not save annotations: {e}")
+            return
+        msg = (f"{'Auto-saved' if silent else 'Saved'} "
+               f"{len(self._annotations)} player(s) → {path.name}")
+        self._annotation_panel.set_status(msg)
+        if not silent:
+            self._status.showMessage(msg)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Add optional data folders after session start
