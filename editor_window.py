@@ -563,6 +563,11 @@ class KeypointEditor(QMainWindow):
             else:
                 pid = mp4.stem.replace(" ", "_")
             vid_map[pid] = mp4
+            # Also store a sanitized variant (apostrophes / special chars → _)
+            # so JSON stems produced by extraction scripts on macOS match too.
+            sanitized = re.sub(r"[^A-Za-z0-9_]", "_", pid)
+            if sanitized != pid:
+                vid_map[sanitized] = mp4
         return vid_map
 
     @staticmethod
