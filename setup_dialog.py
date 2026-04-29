@@ -25,6 +25,7 @@ class SetupDialog(QDialog):
 
     def __init__(self, parent=None,
                  init_videos="", init_poses="", init_poses_3d="",
+                 init_poses_3d_alt="",
                  init_features="", init_anomalies="", init_events="",
                  init_annotations=""):
         super().__init__(parent)
@@ -34,13 +35,14 @@ class SetupDialog(QDialog):
 
         self._settings = QSettings("NFL-Combine", "KeypointEditor")
 
-        self.video_folder    = ""
-        self.poses_folder    = ""
-        self.poses_3d_folder = ""
-        self.features_csv    = ""
-        self.anomaly_csv     = ""
-        self.events_folder   = ""
-        self.annotations_csv = ""
+        self.video_folder        = ""
+        self.poses_folder        = ""
+        self.poses_3d_folder     = ""
+        self.poses_3d_alt_folder = ""
+        self.features_csv        = ""
+        self.anomaly_csv         = ""
+        self.events_folder       = ""
+        self.annotations_csv     = ""
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
@@ -71,17 +73,26 @@ class SetupDialog(QDialog):
         )
         layout.addWidget(pose_grp)
 
-        # 3D Poses folder
+        # 3D Poses folder (primary)
         self._pose3d_edit, pose3d_grp = self._folder_row(
             "3D Poses Folder  (optional)",
-            "Folder containing 3D pose JSONs from a lifting model  "
-            "(e.g. outputs/poses_3d_motionagformer/ or outputs/poses_3d_4dhumans/).  "
-            "Use convert_4dhumans.py to convert 4D-Humans pkl outputs first.  "
-            "Leave empty to skip.",
+            "Primary 3D pose JSONs — e.g. outputs/poses_3d_4dhumans/ (4D-Humans) or "
+            "outputs/poses_3d_motionagformer/.  Leave empty to skip.",
             init_poses_3d or self._settings.value("last_poses_3d_dir", ""),
             required=False,
         )
         layout.addWidget(pose3d_grp)
+
+        # 3D Poses folder (alt — e.g. TRAM)
+        self._pose3d_alt_edit, pose3d_alt_grp = self._folder_row(
+            "Alt 3D Poses Folder  (optional)",
+            "Alternate 3D source overlaid in cyan/orange — e.g. outputs/poses_3d_tram/. "
+            "Shown alongside the primary source; toggle with the 'Alt' button. "
+            "Leave empty to skip.",
+            init_poses_3d_alt or self._settings.value("last_poses_3d_alt_dir", ""),
+            required=False,
+        )
+        layout.addWidget(pose3d_alt_grp)
 
         # Features folder
         self._feat_edit, feat_grp = self._folder_row(
@@ -390,10 +401,11 @@ class SetupDialog(QDialog):
         self._ok_btn.setEnabled(ok)
 
     def _accept(self):
-        self.video_folder    = self._vid_edit.text().strip()
-        self.poses_folder    = self._pose_edit.text().strip()
-        self.poses_3d_folder = self._pose3d_edit.text().strip()
-        self.events_folder   = self._events_edit.text().strip()
+        self.video_folder        = self._vid_edit.text().strip()
+        self.poses_folder        = self._pose_edit.text().strip()
+        self.poses_3d_folder     = self._pose3d_edit.text().strip()
+        self.poses_3d_alt_folder = self._pose3d_alt_edit.text().strip()
+        self.events_folder       = self._events_edit.text().strip()
         if self._feat_csv_combo.count() == 1:
             self.features_csv = self._feat_csv_combo.itemText(0)
         elif self._feat_csv_combo.count() > 1:
@@ -406,9 +418,10 @@ class SetupDialog(QDialog):
             self.anomaly_csv = self._anom_csv_combo.currentText()
         else:
             self.anomaly_csv = ""
-        self._settings.setValue("last_video_folder",    self.video_folder)
-        self._settings.setValue("last_poses_parent",    self.poses_folder)
-        self._settings.setValue("last_poses_3d_dir",    self.poses_3d_folder)
+        self._settings.setValue("last_video_folder",      self.video_folder)
+        self._settings.setValue("last_poses_parent",      self.poses_folder)
+        self._settings.setValue("last_poses_3d_dir",      self.poses_3d_folder)
+        self._settings.setValue("last_poses_3d_alt_dir",  self.poses_3d_alt_folder)
         self._settings.setValue("last_features_folder",
                                 Path(self.features_csv).parent.as_posix()
                                 if self.features_csv else "")

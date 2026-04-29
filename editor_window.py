@@ -99,19 +99,21 @@ class KeypointEditor(QMainWindow):
 
     def __init__(self, video_folder: str = "", poses_parent: str = "",
                  features_csv: str = "", anomaly_csv: str = "",
-                 poses_3d_dir: str = "", events_dir: str = "",
+                 poses_3d_dir: str = "", poses_3d_alt_dir: str = "",
+                 events_dir: str = "",
                  start_in_edit: bool = False):
         super().__init__()
         self.setWindowTitle("Keypoint Editor")
         self.resize(1560, 900)
 
         # ── Session data ──────────────────────────────────────────────────────
-        self._video_folder  = video_folder
-        self._poses_parent  = poses_parent
-        self._features_csv  = features_csv
-        self._anomaly_csv   = anomaly_csv
-        self._poses_3d_dir  = poses_3d_dir
-        self._events_dir    = events_dir     # optional drill-event sidecar JSONs
+        self._video_folder    = video_folder
+        self._poses_parent    = poses_parent
+        self._features_csv    = features_csv
+        self._anomaly_csv     = anomaly_csv
+        self._poses_3d_dir    = poses_3d_dir
+        self._poses_3d_alt_dir = poses_3d_alt_dir
+        self._events_dir      = events_dir     # optional drill-event sidecar JSONs
 
         self._current_model: str = ""
         self._players:       dict[str, dict] = {}
@@ -135,7 +137,8 @@ class KeypointEditor(QMainWindow):
         self._annotations:      dict[str, dict[str, int]] = {}  # pid → {ev_key → vframe}
         self._annotations_csv:  str = ""
 
-        self._frames_3d:    dict[int, np.ndarray] = {}   # NEW
+        self._frames_3d:     dict[int, np.ndarray] = {}
+        self._frames_3d_alt: dict[int, np.ndarray] = {}
 
         self._feat_df:  object = None
         self._anom_df:  object = None
@@ -500,6 +503,7 @@ class KeypointEditor(QMainWindow):
         dlg = SetupDialog(
             self,
             self._video_folder, self._poses_parent, self._poses_3d_dir,
+            self._poses_3d_alt_dir,
             self._features_csv, self._anomaly_csv, self._events_dir,
             self._annotations_csv,
         )
@@ -507,13 +511,14 @@ class KeypointEditor(QMainWindow):
             if not self._video_folder:
                 QApplication.quit()
             return
-        self._video_folder    = dlg.video_folder
-        self._poses_parent    = dlg.poses_folder
-        self._poses_3d_dir    = dlg.poses_3d_folder
-        self._features_csv    = dlg.features_csv
-        self._anomaly_csv     = dlg.anomaly_csv
-        self._events_dir      = dlg.events_folder
-        self._annotations_csv = dlg.annotations_csv
+        self._video_folder      = dlg.video_folder
+        self._poses_parent      = dlg.poses_folder
+        self._poses_3d_dir      = dlg.poses_3d_folder
+        self._poses_3d_alt_dir  = dlg.poses_3d_alt_folder
+        self._features_csv      = dlg.features_csv
+        self._anomaly_csv       = dlg.anomaly_csv
+        self._events_dir        = dlg.events_folder
+        self._annotations_csv   = dlg.annotations_csv
         self._annotations.clear()
         self._current_model = ""
         self._init_session()
@@ -709,6 +714,8 @@ class KeypointEditor(QMainWindow):
         self._list_idx = 0
         self._frames_3d = self._load_3d_poses(self._current_pid)
         self._skeleton_3d.load_player(self._frames_3d)
+        self._frames_3d_alt = self._load_3d_poses(self._current_pid, alt=True)
+        self._skeleton_3d.load_alt_player(self._frames_3d_alt)
         self._show(0)
         self.view.fit()
         self._status.showMessage(
@@ -773,15 +780,15 @@ class KeypointEditor(QMainWindow):
     # Player loading (3D data integrated)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _load_3d_poses(self, pid: str) -> dict[int, np.ndarray]:
+    def _load_3d_poses(self, pid: str, alt: bool = False) -> dict[int, np.ndarray]:
         """
         Load 3D keypoints for a player.
 
-        Priority:
+        Priority (primary, alt=False):
           1. Explicit 3D poses folder (configured via File → New Session).
-          2. keypoints_3d fields in the already-loaded 2D pose JSON — so
-             selecting a 3D model (e.g. poses_3d_motionagformer) as the active
-             model automatically populates the 3D panel with no extra setup.
+          2. keypoints_3d fields in the already-loaded 2D pose JSON.
+
+        For alt=True only the explicit alt 3D dir is checked (no JSON fallback).
 
         Returns dict mapping video frame index → (17, 3) float32 array,
         or empty dict if no 3D data is available.
@@ -794,7 +801,19 @@ class KeypointEditor(QMainWindow):
                     out[entry["frame"]] = np.array(kps3d, dtype=np.float32)
             return out
 
-        # 1 — explicit 3D directory
+        if alt:
+            # Alt source: only from explicit alt dir
+            if self._poses_3d_alt_dir:
+                p = Path(self._poses_3d_alt_dir) / f"{pid}.json"
+                if p.is_file():
+                    try:
+                        with open(p) as f:
+                            return _extract(json.load(f))
+                    except Exception:
+                        pass
+            return {}
+
+        # 1 — explicit primary 3D directory
         if self._poses_3d_dir:
             p = Path(self._poses_3d_dir) / f"{pid}.json"
             if p.is_file():
@@ -867,9 +886,13 @@ class KeypointEditor(QMainWindow):
         self._slider.setValue(0)
         self._slider.blockSignals(False)
 
-        # Load 3D poses (NEW)
+        # Load primary 3D poses
         self._frames_3d = self._load_3d_poses(pid)
         self._skeleton_3d.load_player(self._frames_3d)
+
+        # Load alt 3D poses (e.g. TRAM) if configured
+        self._frames_3d_alt = self._load_3d_poses(pid, alt=True)
+        self._skeleton_3d.load_alt_player(self._frames_3d_alt)
 
         # Restore player state
         state = self._player_states.get(pid)
@@ -935,10 +958,12 @@ class KeypointEditor(QMainWindow):
             self.view.fit()
 
         has_3d = bool(self._frames_3d)
+        has_3d_alt = bool(self._frames_3d_alt)
         n_poses = len(self._frame_map)
         self._status.showMessage(
             f"{pid}  |  {n} frames  |  {n_poses} poses  |  {self._fps:.1f} fps"
             + (f"  |  3D: {len(self._frames_3d)} frames" if has_3d else "  |  3D: none")
+            + (f"  |  Alt: {len(self._frames_3d_alt)} frames" if has_3d_alt else "  |  Alt: none")
             + (f"  |  {len(self._anomaly_frames)} anomalous" if self._anomaly_frames else "")
         )
 

@@ -2,7 +2,14 @@
 skeleton_3d.py — interactive 3D skeleton viewer backed by pyqtgraph/OpenGL.
 
 Displays COCO-17 pose keypoints in 3D for the current video frame.
-Data source: MotionAGFormer (or any lifter) JSON with keypoints_3d field.
+Supports two simultaneous 3D sources (e.g. 4D-Humans + TRAM) with
+distinct colour schemes and an on/off toggle for the alt skeleton.
+
+Primary source (green/red) — loaded via load_player().
+Alt source     (cyan/orange) — loaded via load_alt_player(); toggle with the
+                                "Alt" button or programmatically via set_alt_visible().
+
+Data source: any Ravens pose JSON with keypoints_3d field.
 
 Coordinate convention (input data):
   - Y is DOWN in camera space (image convention: Y increases downward,
@@ -54,10 +61,15 @@ from constants import COCO_SKELETON, LEFT_KPS, RIGHT_KPS
 
 # ── Colour palette (RGBA float32, mirrors 2D editor conventions) ───────────────
 
-_C_LEFT   = (0.20, 0.85, 0.20, 1.0)   # green  — left side
-_C_RIGHT  = (0.85, 0.20, 0.20, 1.0)   # red    — right side
-_C_CENTER = (0.85, 0.80, 0.20, 1.0)   # amber  — centre (nose)
+_C_LEFT   = (0.20, 0.85, 0.20, 1.0)   # green  — left side  (primary)
+_C_RIGHT  = (0.85, 0.20, 0.20, 1.0)   # red    — right side (primary)
+_C_CENTER = (0.85, 0.80, 0.20, 1.0)   # amber  — centre     (primary)
 _C_GRID   = (0.31, 0.31, 0.31, 0.70)
+
+# Alt skeleton colours (cyan/orange scheme)
+_C_ALT_LEFT   = (0.10, 0.80, 0.90, 0.85)   # cyan
+_C_ALT_RIGHT  = (0.95, 0.55, 0.10, 0.85)   # orange
+_C_ALT_CENTER = (0.85, 0.85, 0.85, 0.85)   # light grey
 
 
 def _joint_colors() -> np.ndarray:
@@ -86,10 +98,38 @@ def _build_bone_colors() -> np.ndarray:
     return c
 
 
+def _alt_joint_colors() -> np.ndarray:
+    """Return (17, 4) float32 RGBA per joint for the alt skeleton."""
+    c = np.zeros((17, 4), dtype=np.float32)
+    for i in range(17):
+        c[i] = _C_ALT_LEFT if i in LEFT_KPS else (
+            _C_ALT_RIGHT if i in RIGHT_KPS else _C_ALT_CENTER)
+    return c
+
+
+def _alt_bone_color(a: int, b: int) -> tuple:
+    if a in LEFT_KPS and b in LEFT_KPS:
+        return _C_ALT_LEFT
+    if a in RIGHT_KPS and b in RIGHT_KPS:
+        return _C_ALT_RIGHT
+    return _C_ALT_CENTER
+
+
+def _build_alt_bone_colors() -> np.ndarray:
+    n = len(COCO_SKELETON)
+    c = np.zeros((n * 2, 4), dtype=np.float32)
+    for i, (a, b) in enumerate(COCO_SKELETON):
+        col = _alt_bone_color(a, b)
+        c[i * 2] = c[i * 2 + 1] = col
+    return c
+
+
 # Precomputed constants — built once at import time
-_JOINT_COLORS = _joint_colors()
-_BONE_COLORS  = _build_bone_colors()
-_N_BONES      = len(COCO_SKELETON)
+_JOINT_COLORS     = _joint_colors()
+_BONE_COLORS      = _build_bone_colors()
+_ALT_JOINT_COLORS = _alt_joint_colors()
+_ALT_BONE_COLORS  = _build_alt_bone_colors()
+_N_BONES          = len(COCO_SKELETON)
 
 
 # ── AxisGizmo ──────────────────────────────────────────────────────────────────
@@ -234,9 +274,12 @@ class Skeleton3DPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._frames_3d: dict[int, np.ndarray] = {}
+        self._frames_3d:     dict[int, np.ndarray] = {}
+        self._frames_3d_alt: dict[int, np.ndarray] = {}
+        self._alt_visible:   bool = True
         self._current_frame: int = -1
-        self._bone_pts = np.zeros((_N_BONES * 2, 3), dtype=np.float32)
+        self._bone_pts     = np.zeros((_N_BONES * 2, 3), dtype=np.float32)
+        self._bone_pts_alt = np.zeros((_N_BONES * 2, 3), dtype=np.float32)
         self._label_items: list = []
         self._current_view: str = "Frontal"
 
@@ -278,7 +321,30 @@ class Skeleton3DPanel(QWidget):
         lbl = QLabel("3D Skeleton")
         lbl.setStyleSheet("color:#d4d4d4; font-size:12px; font-weight:bold;")
         h.addWidget(lbl)
+
+        # Alt source legend dots
+        self._legend_lbl = QLabel(
+            '<span style="color:#33cccc;">■</span> Primary &nbsp;'
+            '<span style="color:#f28a20;">■</span> Alt'
+        )
+        self._legend_lbl.setStyleSheet("color:#aaa; font-size:11px; padding-left:8px;")
+        self._legend_lbl.setVisible(False)
+        h.addWidget(self._legend_lbl)
+
         h.addStretch()
+
+        # Alt toggle button
+        self._alt_btn = QPushButton("Alt: ON")
+        self._alt_btn.setFixedHeight(20)
+        self._alt_btn.setCheckable(True)
+        self._alt_btn.setChecked(True)
+        self._alt_btn.setVisible(False)
+        self._alt_btn.setStyleSheet(
+            "background:#0e639c; color:#fff; border:none; border-radius:2px; "
+            "padding:0 6px; font-size:11px;"
+        )
+        self._alt_btn.clicked.connect(self._on_alt_toggle)
+        h.addWidget(self._alt_btn)
 
         # Feature A — Az/El text readout
         self._angle_label = QLabel("Az  +0°  El  +0°")
@@ -379,6 +445,26 @@ class Skeleton3DPanel(QWidget):
         )
         self._gl.addItem(self._bone_item)
 
+        # ── Alt skeleton GL items (hidden until load_alt_player() called) ──────
+        self._alt_joint_item = gl.GLScatterPlotItem(
+            pos=np.zeros((17, 3), dtype=np.float32),
+            color=_ALT_JOINT_COLORS,
+            size=6.0,
+            pxMode=True,
+        )
+        self._alt_joint_item.setVisible(False)
+        self._gl.addItem(self._alt_joint_item)
+
+        self._alt_bone_item = gl.GLLinePlotItem(
+            pos=self._bone_pts_alt.copy(),
+            color=_ALT_BONE_COLORS,
+            width=1.5,
+            antialias=True,
+            mode='lines',
+        )
+        self._alt_bone_item.setVisible(False)
+        self._gl.addItem(self._alt_bone_item)
+
         # Per-joint index labels
         self._label_items: list = []
         for i in range(17):
@@ -456,6 +542,42 @@ class Skeleton3DPanel(QWidget):
             self._gl.hide()
             self._no_data.show()
 
+    def load_alt_player(self, frames_3d_alt: dict):
+        """
+        Load an alternate 3D source (e.g. TRAM) for the current player.
+
+        Parameters
+        ----------
+        frames_3d_alt : dict mapping frame_idx → np.ndarray (17, 3), or None/{}
+                        to clear the alt skeleton.
+        """
+        self._frames_3d_alt = frames_3d_alt or {}
+        self._current_frame = -1   # force re-render
+
+        has_alt = bool(self._frames_3d_alt)
+        self._alt_btn.setVisible(has_alt)
+        self._legend_lbl.setVisible(has_alt)
+        if _GL_OK:
+            show = has_alt and self._alt_visible
+            self._alt_joint_item.setVisible(show)
+            self._alt_bone_item.setVisible(show)
+
+    def set_alt_visible(self, visible: bool):
+        """Programmatically show/hide the alt skeleton."""
+        self._alt_visible = visible
+        self._alt_btn.setChecked(visible)
+        self._alt_btn.setText("Alt: ON" if visible else "Alt: OFF")
+        self._alt_btn.setStyleSheet(
+            ("background:#0e639c;" if visible else "background:#3c3c3c;") +
+            " color:#fff; border:none; border-radius:2px; padding:0 6px; font-size:11px;"
+        )
+        if _GL_OK and self._frames_3d_alt:
+            self._alt_joint_item.setVisible(visible)
+            self._alt_bone_item.setVisible(visible)
+
+    def _on_alt_toggle(self):
+        self.set_alt_visible(self._alt_btn.isChecked())
+
     def update_frame(self, frame_idx: int):
         """
         Update the 3D display to the given video frame index.
@@ -469,6 +591,10 @@ class Skeleton3DPanel(QWidget):
         kps = self._frames_3d.get(frame_idx)
         if kps is not None:
             self._render(kps)
+        if self._frames_3d_alt and self._alt_visible:
+            kps_alt = self._frames_3d_alt.get(frame_idx)
+            if kps_alt is not None:
+                self._render_alt(kps_alt)
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
@@ -507,6 +633,27 @@ class Skeleton3DPanel(QWidget):
         # Update index labels — offset slightly so they don't overlap the dot
         for i, lbl in enumerate(self._label_items):
             lbl.setData(pos=pts[i] + np.array([0.01, 0.01, 0.0], dtype=np.float32))
+
+    def _render_alt(self, kps: np.ndarray):
+        """Push alt-source keypoints to the alt GL items (same coordinate pipeline)."""
+        pts = kps.astype(np.float32).copy()
+        root = (pts[11] + pts[12]) / 2.0
+        pts -= root
+        pts[:, 0] *= self._x_scale_corr
+        pts[:, 1] = -pts[:, 1]
+        if self._current_view == "Sagittal":
+            pts[:, 0], pts[:, 2] = pts[:, 2].copy(), pts[:, 0].copy()
+        pts[:, 1], pts[:, 2] = pts[:, 2].copy(), pts[:, 1].copy()
+
+        self._alt_joint_item.setData(pos=pts, color=_ALT_JOINT_COLORS, size=6.0, pxMode=True)
+        for i, (a, b) in enumerate(COCO_SKELETON):
+            self._bone_pts_alt[i * 2]     = pts[a]
+            self._bone_pts_alt[i * 2 + 1] = pts[b]
+        self._alt_bone_item.setData(pos=self._bone_pts_alt,
+                                    color=_ALT_BONE_COLORS,
+                                    width=1.5,
+                                    antialias=True,
+                                    mode='lines')
 
     # ── Camera preset handling ────────────────────────────────────────────────
 
@@ -551,6 +698,10 @@ class Skeleton3DPanel(QWidget):
             kps = self._frames_3d.get(self._current_frame)
             if kps is not None:
                 self._render(kps)
+            if self._frames_3d_alt and self._alt_visible:
+                kps_alt = self._frames_3d_alt.get(self._current_frame)
+                if kps_alt is not None:
+                    self._render_alt(kps_alt)
 
         self._anim_timer.stop()
         self._anim_timer.start(16)   # ~60 fps
